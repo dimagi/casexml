@@ -14,6 +14,7 @@ from casexml.apps.case.sharedmodels import IndexHoldingMixIn, CommCareCaseIndex
 from copy import copy
 import itertools
 from dimagi.utils.couch.database import get_db
+from corehq.apps.sms.mixin import CommCareMobileContactMixin
 
 """
 Couch models for commcare cases.  
@@ -144,7 +145,7 @@ class Referral(CaseBase):
         
         return ref_list
 
-class CommCareCase(CaseBase, IndexHoldingMixIn):
+class CommCareCase(CaseBase, IndexHoldingMixIn, CommCareMobileContactMixin):
     """
     A case, taken from casexml.  This represents the latest
     representation of the case - the result of playing all
@@ -417,5 +418,11 @@ class CommCareCase(CaseBase, IndexHoldingMixIn):
     def to_xml(self, version):
         from xml.etree import ElementTree
         return ElementTree.tostring(get_case_element(self, ('create', 'update'), version))
+    
+    def get_time_zone(self):
+        return self.get_case_property("time_zone")
+    
+    def get_language_code(self):
+        return self.get_case_property("language_code")
 
 import casexml.apps.case.signals
