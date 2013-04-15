@@ -28,7 +28,7 @@
         <td>Attachments</td><td>
             {% for form_id, filename in case.attachments %}
             {% if not forloop.first %}<br>{% endif %}
-            <a href="{% url xform_attachment form_id filename %}">{{ filename }}</a>
+            <a href="{% url 'xform_attachment' form_id filename %}">{{ filename }}</a>
             {% empty %}
                 <h6>No Attachments</h6>
             {% endfor %}
