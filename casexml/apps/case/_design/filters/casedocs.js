@@ -3,5 +3,12 @@
  */
 function(doc, req)
 {
-    return (doc["doc_type"] === "CommCareCase" || doc._deleted);
+    var doc_type = doc.doc_type;
+    switch (doc_type) {
+        case "CommCareCase":
+        case "CommCareCase-Deleted":
+            return true;
+        default:
+            return false;
+    }
 }
