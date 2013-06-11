@@ -320,6 +320,17 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
                                  include_docs=False):
             yield cls.wrap(res['value'])
 
+    @classmethod
+    def by_domain(cls, domain, ids_only=False):
+        key = ["all", domain]
+        results = cls.view('case/all_cases',
+            startkey=key,
+            endkey=key + [{}],
+            reduce=False,
+            include_docs=not ids_only,
+        )
+        return results if not ids_only else [r['id'] for r in results]
+
     def get_preloader_dict(self):
         """
         Gets the case as a dictionary for use in touchforms preloader framework
