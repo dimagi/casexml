@@ -2,7 +2,7 @@ from __future__ import absolute_import
 import re
 from django.core.cache import cache
 from django.conf import settings
-from django.utils.translation import ugettext_noop, ugettext as _
+from django.utils.translation import ugettext as _
 
 from casexml.apps.phone.xml import get_case_element
 from casexml.apps.case.signals import case_post_save
@@ -29,6 +29,11 @@ Couch models for commcare cases.
 
 For details on casexml check out:
 http://bitbucket.org/javarosa/javarosa/wiki/casexml
+
+Note: DateTimeProperty values created from a case update before 7/13 removed
+the timezone from the input without converting to UTC, so those are probably
+not correct if returned as UTC.  For the correct times, directly inspect the
+case updates.
 """
 
 if getattr(settings, 'CASE_WRAPPER', None):
@@ -150,12 +155,13 @@ class Referral(CaseBase):
             self.modified_on = date
         
         if const.REFERRAL_TAG_FOLLOWUP_DATE in referral_block:
-            self.followup_on = parsing.string_to_datetime(referral_block[const.REFERRAL_TAG_FOLLOWUP_DATE])
+            self.followup_on = parsing.string_to_utc_datetime(
+                    referral_block[const.REFERRAL_TAG_FOLLOWUP_DATE])
         
         if const.REFERRAL_TAG_DATE_CLOSED in update_block:
             self.closed = True
-            self.closed_on = parsing.string_to_datetime(update_block[const.REFERRAL_TAG_DATE_CLOSED])
-            
+            self.closed_on = parsing.string_to_utc_datetime(
+                    update_block[const.REFERRAL_TAG_DATE_CLOSED])
             
     @classmethod
     def from_block(cls, date, block):
@@ -165,7 +171,8 @@ class Referral(CaseBase):
         if not const.REFERRAL_ACTION_OPEN in block:
             raise ValueError("No open tag found in referral block!")
         id = block[const.REFERRAL_TAG_ID]
-        follow_date = parsing.string_to_datetime(block[const.REFERRAL_TAG_FOLLOWUP_DATE])
+        follow_date = parsing.string_to_utc_datetime(
+                block[const.REFERRAL_TAG_FOLLOWUP_DATE])
         open_block = block[const.REFERRAL_ACTION_OPEN]
         types = open_block[const.REFERRAL_TAG_TYPES].split(" ")
         
@@ -404,8 +411,8 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
         """
         case = cls()
         case._id = case_update.id
-        case.modified_on = parsing.string_to_datetime(case_update.modified_on_str) \
-                            if case_update.modified_on_str else datetime.utcnow()
+        case.modified_on = parsing.string_to_utc_datetime(
+                case_update.modified_on_str or datetime.utcnow())
         
         # apply initial updates, referrals and such, if present
         case.update_from_case_update(case_update, xformdoc)
@@ -436,8 +443,8 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
     
     def update_from_case_update(self, case_update, xformdoc):
         
-        mod_date = parsing.string_to_datetime(case_update.modified_on_str) \
-                    if   case_update.modified_on_str else datetime.utcnow()
+        mod_date = parsing.string_to_utc_datetime(
+                case_update.modified_on_str or datetime.utcnow())
         
         if self.modified_on is None or mod_date > self.modified_on:
             self.modified_on = mod_date
