@@ -87,7 +87,9 @@ def generate_restore_payload(user, restore_id="", version="1.0", state_hash=""):
     # case blocks
     for case_elem in case_xml_elements:
         response.append(case_elem)
-    
+
+    response.attrib['items'] = '%d' % len(response.getchildren())
+
     return xml.tostring(response)
 
     
