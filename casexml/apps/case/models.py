@@ -1049,6 +1049,20 @@ class CommCareCaseGroup(Document):
         # However, the entire mixin is not necessary.
         return self.timezone
 
+    def get_cases(self, limit=None, skip=None):
+        case_ids = self.cases
+        if skip is not None:
+            case_ids = case_ids[skip:]
+        if limit is not None:
+            case_ids = case_ids[:limit]
+        for case_id in case_ids:
+            try:
+                yield CommCareCase.get(case_id)
+            except ResourceNotFound:
+                # purge any non-existent cases from the cases list
+                del self.cases[case_id]
+                self.save()
+
     @classmethod
     def get_all(cls, domain, limit=None, skip=None):
         extra_kwargs = {}
