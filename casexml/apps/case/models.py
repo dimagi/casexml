@@ -994,6 +994,43 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin, CaseQuery
     def related_type_info(self):
         return None
 
+    @classmethod
+    def get_by_identifier(cls, domain, case_identifier):
+        """
+        Get a CommCareCase first by trying the following as the identifier in this order:
+        - phone number
+        - external id
+        - case id
+        """
+        # Try by phone number
+        case = cls._by_identifier("phone_number", domain, case_identifier)
+        if case is not None:
+            return case
+
+        # Try by external id
+        case = cls._by_identifier("external_id", domain, case_identifier)
+        if case is not None:
+            return case
+
+        # Try by case id
+        try:
+            return cls.get(case_identifier)
+        except (ResourceNotFound, KeyError):
+            pass
+        return None
+
+    @classmethod
+    def _by_identifier(cls, identifier_type, domain, identifier):
+        key = [identifier_type, domain, identifier]
+        return CommCareCase.view(
+            'case/by_identifier',
+            startkey=key,
+            endkey=key + [{}],
+            limit=1,
+            include_docs=True,
+            reduce=False
+        ).first()
+
 
 import casexml.apps.case.signals
 
