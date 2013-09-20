@@ -990,6 +990,49 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin, CaseQuery
     def related_type_info(self):
         return None
 
+    @classmethod
+    def get_by_identifier(cls, domain, case_identifier):
+        """
+        Get a CommCareCase first by trying the following as the identifier in this order:
+        - phone number
+        - external id
+        - case id
+        """
+        # Try by phone number
+        case = cls._by_identifier(domain, "contact_phone_number", case_identifier)
+        if case is not None:
+            return case
+
+        # Try by external id
+        case = cls._by_identifier("external_id", domain, case_identifier)
+        if case is not None:
+            return case
+
+        # Try by case id
+        try:
+            return cls.get(case_identifier)
+        except (ResourceNotFound, KeyError):
+            pass
+
+        return None
+
+    @classmethod
+    def _by_identifier(cls, domain, identifier_type, identifier):
+        # circular import
+        from corehq.apps.api.es import CaseES
+        case_es = CaseES(domain)
+        q = case_es.base_query(
+            terms={
+                identifier_type: identifier,
+            },
+            fields=['_id', identifier_type],
+            size=1
+        )
+        response = case_es.run_query(q)
+        raw_docs = response['hits']['hits']
+        if raw_docs:
+            return CommCareCase.get(raw_docs[0]['_id'])
+
 
 import casexml.apps.case.signals
 
