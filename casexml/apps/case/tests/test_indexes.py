@@ -1,14 +1,18 @@
 from xml.etree import ElementTree
-from casexml.apps.case.tests.util import CaseBlock, check_user_has_case
+from casexml.apps.case import settings
+from casexml.apps.case.mock import CaseBlock
+from casexml.apps.case.tests.util import check_user_has_case
 from casexml.apps.case.util import post_case_blocks
 from casexml.apps.case.xml import V2
 from casexml.apps.phone.models import User
 from django.test import TestCase
+from dimagi.utils.parsing import json_format_datetime
 
 USER_ID = 'test-index-user'
-        
+
 class IndexTest(TestCase):
     def testIndexes(self):
+        settings.CASEXML_FORCE_DOMAIN_CHECK = False
         CASE_ID = 'test-index-case'
         MOTHER_CASE_ID = 'text-index-mother-case'
         FATHER_CASE_ID = 'text-index-father-case'
@@ -20,7 +24,7 @@ class IndexTest(TestCase):
                 CaseBlock(create=True, case_id=prereq, user_id=USER_ID,
                           version=V2).as_xml()
             ])
-            
+
         # Step 1. Create a case with index <mom>
         create_index = CaseBlock(
             create=True,
@@ -29,7 +33,7 @@ class IndexTest(TestCase):
             owner_id=USER_ID,
             index={'mom': ('mother-case', MOTHER_CASE_ID)},
             version=V2
-        ).as_xml()
+        ).as_xml(format_datetime=json_format_datetime)
 
         post_case_blocks([create_index])
         check_user_has_case(self, user, create_index, version=V2)
@@ -41,7 +45,7 @@ class IndexTest(TestCase):
             user_id=USER_ID,
             index={'mom': ('mother-case', ''), 'dad': ('father-case', FATHER_CASE_ID)},
             version=V2
-        ).as_xml()
+        ).as_xml(format_datetime=json_format_datetime)
 
         update_index_expected = CaseBlock(
             case_id=CASE_ID,
@@ -50,7 +54,7 @@ class IndexTest(TestCase):
             create=True,
             index={'dad': ('father-case', FATHER_CASE_ID)},
             version=V2
-        ).as_xml()
+        ).as_xml(format_datetime=json_format_datetime)
 
         post_case_blocks([update_index])
 
@@ -63,21 +67,22 @@ class IndexTest(TestCase):
             user_id=USER_ID,
             index={'mom': ('mother-case', MOTHER_CASE_ID)},
             version=V2
-        ).as_xml()
+        ).as_xml(format_datetime=json_format_datetime)
 
         update_index_expected = CaseBlock(
             case_id=CASE_ID,
             user_id=USER_ID,
             owner_id=USER_ID,
             create=True,
-            index={'mom': ('mother-case', MOTHER_CASE_ID), 'dad': ('father-case', FATHER_CASE_ID)},
+            index={'mom': ('mother-case', MOTHER_CASE_ID),
+                   'dad': ('father-case', FATHER_CASE_ID)},
             version=V2
-        ).as_xml()
+        ).as_xml(format_datetime=json_format_datetime)
 
         post_case_blocks([update_index])
 
         check_user_has_case(self, user, update_index_expected, version=V2)
-        
+
     def testBadIndexReference(self):
         CASE_ID = 'test-bad-index-case'
         block = CaseBlock(create=True, case_id=CASE_ID, user_id=USER_ID, version=V2,
@@ -87,4 +92,3 @@ class IndexTest(TestCase):
             self.fail("Submitting against a bad case in an index should fail!")
         except Exception:
             pass
-        

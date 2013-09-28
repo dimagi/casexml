@@ -1,10 +1,14 @@
-from couchdbkit.ext.django.schema import *
+import mimetypes
+from couchdbkit.ext.django.schema import StringProperty, IntegerProperty, DictProperty
+
 from dimagi.utils.mixins import UnicodeMixIn
 from dimagi.utils.couch import LooselyEqualDocumentSchema
+
 
 """
 Shared models live here to avoid cyclical import issues
 """
+
 
 class CommCareCaseIndex(LooselyEqualDocumentSchema, UnicodeMixIn):
     """
@@ -16,8 +20,8 @@ class CommCareCaseIndex(LooselyEqualDocumentSchema, UnicodeMixIn):
     
     @property
     def referenced_case(self):
-        from casexml.apps.case.models import CommCareCase
         if not hasattr(self, "_case"):
+            from casexml.apps.case.models import CommCareCase
             self._case = CommCareCase.get(self.referenced_id)
         return self._case
     
@@ -39,6 +43,55 @@ class CommCareCaseIndex(LooselyEqualDocumentSchema, UnicodeMixIn):
     def __repr__(self):
         return str(self)
 
+
+class CommCareCaseAttachment(LooselyEqualDocumentSchema, UnicodeMixIn):
+    identifier = StringProperty()
+    attachment_src = StringProperty()
+    attachment_from = StringProperty()
+    attachment_name = StringProperty()
+    server_mime = StringProperty()  # Server detected MIME
+    server_md5 = StringProperty()  # Couch detected hash
+
+    attachment_size = IntegerProperty()  # file size
+    attachment_properties = DictProperty()  # width, height, other relevant metadata
+
+    @property
+    def is_image(self):
+        return True if self.server_mime.startswith('image/') else False
+
+    @property
+    def is_present(self):
+        """
+        Helper method to see if this is a delete vs. update
+        """
+        if self.identifier and (self.attachment_src == self.attachment_from is None):
+            return False
+        else:
+            return True
+
+    @property
+    def attachment_key(self):
+        return self.identifier
+
+    @classmethod
+    def from_case_index_update(cls, attachment):
+        if attachment.attachment_src:
+            guessed = mimetypes.guess_type(attachment.attachment_src)
+            if len(guessed) > 0 and guessed[0] is not None:
+                mime_type = guessed[0]
+            else:
+                mime_type = None
+
+            ret = cls(identifier=attachment.identifier,
+                       attachment_src=attachment.attachment_src,
+                       attachment_from=attachment.attachment_from,
+                       attachment_name=attachment.attachment_name,
+                       server_mime=mime_type)
+        else:
+            ret = cls(identifier=attachment.identifier)
+        return ret
+
+
 class IndexHoldingMixIn(object):
     """
     Since multiple objects need this functionality, implement it as a mixin
@@ -55,7 +108,6 @@ class IndexHoldingMixIn(object):
         return None
     
     def update_indices(self, index_update_list):
-        from .models import CommCareCase
         for index_update in index_update_list:
             if index_update.referenced_id:
                 # NOTE: used to check the existence of the referenced

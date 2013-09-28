@@ -1,25 +1,34 @@
 from __future__ import absolute_import
+from StringIO import StringIO
 import re
+from datetime import datetime
+import logging
+from copy import copy
+
 from django.core.cache import cache
+from django.conf import settings
+from django.core.urlresolvers import reverse
+from django.utils import http
+from django.utils.translation import ugettext as _
+from couchdbkit.ext.django.schema import *
+from couchdbkit.exceptions import ResourceNotFound, ResourceConflict
+from PIL import Image
+from dimagi.utils.django.cached_object import CachedObject, OBJECT_ORIGINAL, OBJECT_SIZE_MAP, CachedImage, IMAGE_SIZE_ORDERING
 from casexml.apps.phone.xml import get_case_element
 from casexml.apps.case.signals import case_post_save
 from casexml.apps.case.util import get_close_case_xml, get_close_referral_xml,\
     couchable_property, get_case_xform_ids
-from datetime import datetime
-from couchdbkit.ext.django.schema import *
 from casexml.apps.case import const
-from dimagi.utils import parsing
-import logging
+from dimagi.utils.modules import to_function
+from dimagi.utils import parsing, web
 from dimagi.utils.decorators.memoized import memoized
 from dimagi.utils.indicators import ComputedDocumentMixin
 from receiver.util import spoof_submission
 from couchforms.models import XFormInstance
-from casexml.apps.case.sharedmodels import IndexHoldingMixIn, CommCareCaseIndex
-from copy import copy
-import itertools
-from dimagi.utils.couch.database import get_db, SafeSaveDocument
-from couchdbkit.exceptions import ResourceNotFound, ResourceConflict
+from casexml.apps.case.sharedmodels import IndexHoldingMixIn, CommCareCaseIndex, CommCareCaseAttachment
+from dimagi.utils.couch.database import get_db, SafeSaveDocument, iter_docs
 from dimagi.utils.couch import LooselyEqualDocumentSchema
+
 
 """
 Couch models for commcare cases.  
@@ -27,6 +36,13 @@ Couch models for commcare cases.
 For details on casexml check out:
 http://bitbucket.org/javarosa/javarosa/wiki/casexml
 """
+
+CASE_STATUS_OPEN = 'open'
+CASE_STATUS_CLOSED = 'closed'
+CASE_STATUS_ALL = 'all'
+
+INDEX_ID_PARENT = 'parent'
+
 
 class CaseBase(SafeSaveDocument):
     """
@@ -38,8 +54,16 @@ class CaseBase(SafeSaveDocument):
     closed = BooleanProperty(default=False)
     closed_on = DateTimeProperty()
     
-    class Meta:
-        app_label = 'case'
+    def to_full_dict(self):
+        """
+        Include calculated properties that need to be available to the case
+        details display by overriding this method.
+
+        """
+        json = self.to_json()
+        json['status'] = _('Closed') if self.closed else _('Open')
+
+        return json
 
 
 class CommCareCaseAction(LooselyEqualDocumentSchema):
@@ -48,6 +72,7 @@ class CommCareCaseAction(LooselyEqualDocumentSchema):
     the xml.
     """
     action_type = StringProperty(choices=list(const.CASE_ACTIONS))
+    user_id = StringProperty()
     date = DateTimeProperty()
     server_date = DateTimeProperty()
     xform_id = StringProperty()
@@ -58,13 +83,14 @@ class CommCareCaseAction(LooselyEqualDocumentSchema):
     updated_known_properties = DictProperty()
     updated_unknown_properties = DictProperty()
     indices = SchemaListProperty(CommCareCaseIndex)
+    attachments = SchemaDictProperty(CommCareCaseAttachment)
 
     @classmethod
-    def from_parsed_action(cls, action_type, date, xformdoc, action):
+    def from_parsed_action(cls, action_type, date, user_id, xformdoc, action):
         if not action_type in const.CASE_ACTIONS:
             raise ValueError("%s not a valid case action!")
         
-        ret = CommCareCaseAction(action_type=action_type, date=date)
+        ret = CommCareCaseAction(action_type=action_type, date=date, user_id=user_id)
         
         def _couchify(d):
             return dict((k, couchable_property(v)) for k, v in d.items())
@@ -74,16 +100,25 @@ class CommCareCaseAction(LooselyEqualDocumentSchema):
         ret.xform_xmlns = xformdoc.xmlns
         ret.xform_name = xformdoc.name
         ret.updated_known_properties = _couchify(action.get_known_properties())
+
         ret.updated_unknown_properties = _couchify(action.dynamic_properties)
         ret.indices = [CommCareCaseIndex.from_case_index_update(i) for i in action.indices]
+        ret.attachments = dict((attach_id, CommCareCaseAttachment.from_case_index_update(attach))
+                               for attach_id, attach in action.attachments.items())
         if hasattr(xformdoc, "last_sync_token"):
             ret.sync_log_id = xformdoc.last_sync_token
         return ret
 
     @property
     def xform(self):
-        return XFormInstance.get(self.xform_id) if self.xform_id else None
-        
+        try:
+            return XFormInstance.get(self.xform_id) if self.xform_id else None
+        except ResourceNotFound:
+            logging.exception("couldn't access form {form} inside of a referenced case.".format(
+                form=self.xform_id,
+            ))
+            return None
+
     def get_user_id(self):
         key = 'xform-%s-user_id' % self.xform_id
         id = cache.get(key)
@@ -102,10 +137,6 @@ class CommCareCaseAction(LooselyEqualDocumentSchema):
             date=self.date, server_date=self.server_date
         )
 
-    class Meta:
-        app_label = 'case'
-
-    
 class Referral(CaseBase):
     """
     A referral, taken from casexml.  
@@ -119,9 +150,6 @@ class Referral(CaseBase):
     followup_on = DateTimeProperty()
     outcome = StringProperty()
     
-    class Meta:
-        app_label = 'case'
-
     def __unicode__(self):
         return ("%s:%s" % (self.type, self.referral_id))
         
@@ -132,9 +160,9 @@ class Referral(CaseBase):
         
         update_block = referral_block[const.REFERRAL_ACTION_UPDATE] 
         if not self.type == update_block[const.REFERRAL_TAG_TYPE]:
-            raise logging.warn("Tried to update from a block with a mismatched type!")
+            logging.warn("Tried to update from a block with a mismatched type!")
             return
-        
+
         if date > self.modified_on:
             self.modified_on = date
         
@@ -176,7 +204,54 @@ class Referral(CaseBase):
         
         return ref_list
 
-class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
+
+class CaseQueryMixin(object):
+    @classmethod
+    def get_by_xform_id(cls, xform_id):
+        return cls.view("case/by_xform_id", reduce=False, include_docs=True,
+                        key=xform_id)
+
+    @classmethod
+    def get_all_cases(cls, domain, case_type=None, owner_id=None, status=None,
+                      reduce=False, include_docs=False, **kwargs):
+        """
+        :param domain: The domain the cases belong to.
+        :param type: Restrict results to only cases of this type.
+        :param owner_id: Restrict results to only cases owned by this user / group.
+        :param status: Restrict results to cases with this status. Either 'open' or 'closed'.
+        """
+        key = cls.get_all_cases_key(domain, case_type=case_type, owner_id=owner_id, status=status)
+        return CommCareCase.view('case/all_cases',
+            startkey=key,
+            endkey=key + [{}],
+            reduce=reduce,
+            include_docs=include_docs,
+            **kwargs).all()
+
+    @classmethod
+    def get_all_cases_key(cls, domain, case_type=None, owner_id=None, status=None):
+        """
+        :param status: One of 'all', 'open' or 'closed'.
+        """
+        if status and status not in [CASE_STATUS_ALL, CASE_STATUS_OPEN, CASE_STATUS_CLOSED]:
+            raise ValueError("Invalid value for 'status': '%s'" % status)
+
+        key = [domain]
+        prefix = status or CASE_STATUS_ALL
+        if case_type:
+            prefix += ' type'
+            key += [case_type]
+            if owner_id:
+                prefix += ' owner'
+                key += [owner_id]
+        elif owner_id:
+            prefix += ' owner'
+            key += [owner_id]
+
+        return [prefix] + key
+
+
+class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin, CaseQueryMixin):
     """
     A case, taken from casexml.  This represents the latest
     representation of the case - the result of playing all
@@ -189,26 +264,60 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
     external_id = StringProperty()
     user_id = StringProperty()
     owner_id = StringProperty()
+    opened_by = StringProperty()
+    closed_by = StringProperty()
 
     referrals = SchemaListProperty(Referral)
     actions = SchemaListProperty(CommCareCaseAction)
     name = StringProperty()
     version = StringProperty()
     indices = SchemaListProperty(CommCareCaseIndex)
+    case_attachments = SchemaDictProperty(CommCareCaseAttachment)
+    
+    # TODO: move to commtrack.models.SupplyPointCases (and full regression test)
     location_ = StringListProperty()
 
     server_modified_on = DateTimeProperty()
 
-    class Meta:
-        app_label = 'case'
-
     def __unicode__(self):
         return "CommCareCase: %s (%s)" % (self.case_id, self.get_id)
 
+    def __setattr__(self, key, value):
+        # couchdbkit's auto-type detection gets us into problems for various
+        # workflows here, so just force known string properties to strings
+        # before setting them. this would just end up failing hard later if
+        # it wasn't a string
+        _STRING_ATTRS = ('external_id', 'user_id', 'owner_id', 'opened_by',
+                         'closed_by', 'type', 'name')
+        if key in _STRING_ATTRS:
+            value = unicode(value or '')
+        super(CommCareCase, self).__setattr__(key, value)
 
-    def __get_case_id(self):        return self._id
-    def __set_case_id(self, id):    self._id = id
+    def __get_case_id(self):
+        return self._id
+
+    def __set_case_id(self, id):
+        self._id = id
+    
     case_id = property(__get_case_id, __set_case_id)
+
+    def __repr__(self):
+        return "%s(name=%r, type=%r, id=%r)" % (
+                self.__class__.__name__, self.name, self.type, self._id)
+
+    @property
+    @memoized
+    def parent(self):
+        """
+        Returns the parent case if one exists, else None.
+        NOTE: This property should only return the first parent in the list
+        of indices. If for some reason your use case creates more than one, 
+        please write/use a different property.
+        """
+        for index in self.indices:
+            if index.identifier == INDEX_ID_PARENT:
+                return CommCareCase.get(index.referenced_id)
+        return None
 
     @property
     def server_opened_on(self):
@@ -219,26 +328,26 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
         except Exception:
             pass
 
-
     @property
+    @memoized
     def reverse_indices(self):
-        def wrap_row(row):
-            index = CommCareCaseIndex.wrap(row['value'])
-            index.is_reverse = True
-            return index
         return get_db().view("case/related",
             key=[self.domain, self.get_id, "reverse_index"],
             reduce=False,
-            wrapper=wrap_row
+            wrapper=lambda r: CommCareCaseIndex.wrap(r['value'])
         ).all()
-        
+
+    @memoized
+    def get_subcases(self):
+        subcase_ids = [ix.referenced_id for ix in self.reverse_indices]
+        return CommCareCase.view('_all_docs', keys=subcase_ids, include_docs=True)
+
     @property
-    def all_indices(self):
-        return itertools.chain(self.indices, self.reverse_indices)
+    def has_indices(self):
+        return self.indices or self.reverse_indices
         
-    def get_json(self):
-        
-        return {
+    def get_json(self, lite=False):
+        ret = {
             # referrals and actions excluded here
             "domain": self.domain,
             "case_id": self.case_id,
@@ -266,8 +375,12 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
             }.items()),
             #reorganized
             "indices": self.get_index_map(),
-            "reverse_indices": self.get_index_map(True)
         }
+        if not lite:
+            ret.update({
+                "reverse_indices": self.get_index_map(True),
+            })
+        return ret
 
     @memoized
     def get_index_map(self, reversed=False):
@@ -290,10 +403,24 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
                                           include_docs=False).one()['value'])
 
     @classmethod
+    def get_wrap_class(cls, data):
+        try:
+            settings.CASE_WRAPPER
+        except AttributeError:
+            cls._case_wrapper = None
+        else:
+            CASE_WRAPPER = to_function(settings.CASE_WRAPPER, failhard=True)
+        
+        if CASE_WRAPPER:
+            return CASE_WRAPPER(data) or cls
+        return cls
+
+    @classmethod
     def bulk_get_lite(cls, ids):
         for res in cls.get_db().view("case/get_lite", keys=ids,
                                  include_docs=False):
-            yield CommCareCase.wrap(res['value'])
+            # cls.wrap is called in a lot of places; do they all need to be updated?
+            yield cls.get_wrap_class(res['value']).wrap(res['value'])
 
     def get_preloader_dict(self):
         """
@@ -314,6 +441,7 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
             return getattr(self, property)
         except Exception:
             return None
+
     def set_case_property(self, property, value):
         setattr(self, property, value)
 
@@ -330,7 +458,8 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
         # in theory since case ids are unique and modification dates get updated
         # upon any change, this is all we need
         return "%s::%s" % (self.case_id, self.modified_on)
-    
+
+    @memoized
     def get_forms(self):
         """
         Gets the form docs associated with a case. If it can't find a form
@@ -344,25 +473,133 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
         
         forms = [_get(id) for id in self.xform_ids]
         return [form for form in forms if form] 
-    
-    @property
-    def attachments(self):
+
+    def get_attachment(self, attachment_key):
+        return self.fetch_attachment(attachment_key)
+
+    def get_attachment_server_url(self, attachment_key):
         """
-        Get any attachments associated with this.
-        
-        returns (creating_form_id, attachment_name) tuples 
+        A server specific URL for remote clients to access case attachment resources async.
         """
-        attachments = []
-        for action in self.actions:
-            for prop, val in action.updated_unknown_properties.items():
-                # welcome to hard code city!
-                if isinstance(val, dict) and "@tag" in val and val["@tag"] == "attachment":
-                    attachments.append((action.xform_id, val["#text"]))
-        return attachments
-    
-    def get_attachment(self, attachment_tuple):
-        return XFormInstance.get_db().fetch_attachment(attachment_tuple[0], attachment_tuple[1])
-        
+        if attachment_key in self.case_attachments:
+            return "%s%s" % (web.get_url_base(),
+                             reverse("api_case_attachment", kwargs={
+                                 "domain": self.domain,
+                                 "case_id": self._id,
+                                 "attachment_id": attachment_key,
+                                 "attachment_src": http.urlquote(self.case_attachments[attachment_key]['attachment_src'])}
+                             )
+            )
+        else:
+            return None
+
+
+    @classmethod
+    def cache_and_get_object(cls, cobject, case_id, attachment_key, size_key=OBJECT_ORIGINAL):
+        """
+        Retrieve cached_object or image and cache sizes if necessary
+        """
+        if not cobject.is_cached():
+            resp = cls.get_db().fetch_attachment(case_id, attachment_key, stream=True)
+            stream = StringIO(resp.read())
+            headers = resp.resp.headers
+            cobject.cache_put(stream, headers)
+
+        meta, stream = cobject.get(size_key=size_key)
+        return meta, stream
+
+
+    @classmethod
+    def fetch_case_image(cls, case_id, attachment_key, attachment_filename, filesize_limit=0, width_limit=0, height_limit=0, fixed_size=None):
+        """
+        Return (metadata, stream) information of best matching image attachment.
+        attachment_key is the case property of the attachment
+        attachment filename is the filename of the original submission - full extension and all.
+        """
+        if fixed_size is not None:
+            size_key = fixed_size
+        else:
+            size_key = OBJECT_ORIGINAL
+
+        constraint_dict = {}
+        if filesize_limit:
+            constraint_dict['content_length'] = filesize_limit
+
+        if height_limit:
+            constraint_dict['height'] = height_limit
+
+        if width_limit:
+            constraint_dict['width'] = width_limit
+        do_constrain = bool(constraint_dict)
+
+        #if size key is None, then one of the limit criteria are set
+        attachment_cache_key = "%(case_id)s_%(attachment)s_%(filename)s" % {
+            "case_id": case_id,
+            "attachment": attachment_key,
+            "filename": attachment_filename
+        }
+
+        cached_image = CachedImage(attachment_cache_key)
+        meta, stream = cls.cache_and_get_object(cached_image, case_id, attachment_key, size_key=size_key)
+
+        #now that we got it cached, let's check for size constraints
+
+        if do_constrain:
+            #check this size first
+            #see if the current size matches the criteria
+
+            def meets_constraint(constraints, meta):
+                for c, limit in constraints.items():
+                    if meta[c] > limit:
+                        return False
+                return True
+
+            if meets_constraint(constraint_dict, meta):
+                #yay, do nothing
+                pass
+            else:
+                #this meta is no good, find another one
+                lesser_keys = IMAGE_SIZE_ORDERING[0:IMAGE_SIZE_ORDERING.index(size_key)]
+                lesser_keys.reverse()
+                is_met = False
+                for lesser_size in lesser_keys:
+                    less_meta, less_stream = cached_image.get_size(lesser_size)
+                    if meets_constraint(constraint_dict, less_meta):
+                        meta = less_meta
+                        stream = less_stream
+                        is_met = True
+                        break
+                if not is_met:
+                    meta = None
+                    stream = None
+
+        return meta, stream
+
+
+    @classmethod
+    def fetch_case_attachment(cls, case_id, attachment_key, fixed_size=None, **kwargs):
+        """
+        Return (metadata, stream) information of best matching image attachment.
+        TODO: This should be the primary case_attachment retrieval method, the image one is a silly separation of similar functionality
+        Additional functionality to be abstracted by content_type of underlying attachment
+        """
+        size_key = OBJECT_ORIGINAL
+        if fixed_size is not None and fixed_size in OBJECT_SIZE_MAP:
+            size_key = fixed_size
+
+        #if size key is None, then one of the limit criteria are set
+        attachment_cache_key = "%(case_id)s_%(attachment)s" % {
+            "case_id": case_id,
+            "attachment": attachment_key
+        }
+
+        cobject = CachedObject(attachment_cache_key)
+        meta, stream = cls.cache_and_get_object(cobject, case_id, attachment_key, size_key=size_key)
+
+        return meta, stream
+
+    # this is only used by CommTrack SupplyPointCase cases and should go in
+    # that class
     def bind_to_location(self, loc):
         self.location_ = loc.path
 
@@ -371,7 +608,7 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
         """
         Create a case object from a case update object.
         """
-        case = CommCareCase()
+        case = cls()
         case._id = case_update.id
         case.modified_on = parsing.string_to_datetime(case_update.modified_on_str) \
                             if case_update.modified_on_str else datetime.utcnow()
@@ -380,7 +617,7 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
         case.update_from_case_update(case_update, xformdoc)
         return case
     
-    def apply_create_block(self, create_action, xformdoc, modified_on):
+    def apply_create_block(self, create_action, xformdoc, modified_on, user_id):
         # create case from required fields in the case/create block
         # create block
         def _safe_replace_and_force_to_string(me, attr, val):
@@ -390,20 +627,20 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
                 return
             if val:
                 setattr(me, attr, unicode(val))
-            
+
         _safe_replace_and_force_to_string(self, "type", create_action.type)
         _safe_replace_and_force_to_string(self, "name", create_action.name)
         _safe_replace_and_force_to_string(self, "external_id", create_action.external_id)
         _safe_replace_and_force_to_string(self, "user_id", create_action.user_id)
         _safe_replace_and_force_to_string(self, "owner_id", create_action.owner_id)
-        create_action = CommCareCaseAction.from_parsed_action(const.CASE_ACTION_CREATE, 
-                                                              modified_on, 
+        create_action = CommCareCaseAction.from_parsed_action(const.CASE_ACTION_CREATE,
+                                                              modified_on,
+                                                              user_id,
                                                               xformdoc,
                                                               create_action)
         self.actions.append(create_action)
     
     def update_from_case_update(self, case_update, xformdoc):
-        
         mod_date = parsing.string_to_datetime(case_update.modified_on_str) \
                     if   case_update.modified_on_str else datetime.utcnow()
         
@@ -411,14 +648,19 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
             self.modified_on = mod_date
     
         if case_update.creates_case():
-            self.apply_create_block(case_update.get_create_action(), xformdoc, mod_date)
+            self.apply_create_block(case_update.get_create_action(), xformdoc, mod_date, case_update.user_id)
+            # case_update.get_create_action() seems to sometimes return an action with all properties set to none,
+            # so set opened_by and opened_on here
             if not self.opened_on:
                 self.opened_on = mod_date
-        
-        
+            if not self.opened_by:
+                self.opened_by = case_update.user_id
+
+
         if case_update.updates_case():
             update_action = CommCareCaseAction.from_parsed_action(const.CASE_ACTION_UPDATE, 
                                                                   mod_date,
+                                                                  case_update.user_id,
                                                                   xformdoc,
                                                                   case_update.get_update_action())
             self._apply_action(update_action)
@@ -426,9 +668,11 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
         
         if case_update.closes_case():
             close_action = CommCareCaseAction.from_parsed_action(const.CASE_ACTION_CLOSE, 
-                                                                 mod_date, 
+                                                                 mod_date,
+                                                                 case_update.user_id,
                                                                  xformdoc,
                                                                  case_update.get_close_action())
+            self.closed_by = case_update.user_id
             self._apply_action(close_action)
             self.actions.append(close_action)
 
@@ -456,10 +700,20 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
         if case_update.has_indices():
             index_action = CommCareCaseAction.from_parsed_action(const.CASE_ACTION_INDEX, 
                                                                  mod_date,
+                                                                 case_update.user_id,
                                                                  xformdoc,
                                                                  case_update.get_index_action())
             self.actions.append(index_action)
             self._apply_action(index_action)
+
+        if case_update.has_attachments():
+            attachment_action = CommCareCaseAction.from_parsed_action(const.CASE_ACTION_ATTACHMENT,
+                                                                      mod_date,
+                                                                      case_update.user_id,
+                                                                      xformdoc,
+                                                                      case_update.get_attachment_action())
+            self.actions.append(attachment_action)
+            self._apply_action(attachment_action)
 
         # finally override any explicit properties from the update
         if case_update.user_id:     self.user_id = case_update.user_id
@@ -472,10 +726,11 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
             self.update_indices(action.indices)
         elif action.action_type == const.CASE_ACTION_CLOSE:
             self.apply_close(action)
+        elif action.action_type == const.CASE_ACTION_ATTACHMENT:
+            self.apply_attachments(action)
         else:
             raise ValueError("Can't apply action of type %s" % action.action_type)
 
-        
     def apply_updates(self, update_action):
         """
         Applies updates to a case
@@ -483,11 +738,55 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
         for k, v in update_action.updated_known_properties.items():
             setattr(self, k, v)
 
+        properties = self.properties()
         for item in update_action.updated_unknown_properties:
             if item not in const.CASE_TAGS:
-                self[item] = couchable_property(update_action.updated_unknown_properties[item])
-            
-        
+                value = couchable_property(update_action.updated_unknown_properties[item])
+                if isinstance(properties.get(item), StringProperty):
+                    value = unicode(value)
+                self[item] = value
+
+    def apply_attachments(self, attachment_action):
+        #the actions and _attachment must be added before the first saves canhappen
+        #todo attach cached attachment info
+
+        stream_dict = {}
+        #cache all attachment streams from xform
+        for k, v in attachment_action.attachments.items():
+            if v.is_present:
+                #fetch attachment, update metadata, get the stream
+                attach_data = XFormInstance.get_db().fetch_attachment(attachment_action.xform_id, v.identifier)
+                stream_dict[k] = attach_data
+                v.attachment_size = len(attach_data)
+
+                if v.is_image:
+                    img = Image.open(StringIO(attach_data))
+                    img_size = img.size
+                    props = dict(width=img_size[0], height=img_size[1])
+                    v.attachment_properties = props
+
+        self.force_save()
+        update_attachments = {}
+        for k, v in self.case_attachments.items():
+            if v.is_present:
+                update_attachments[k] = v
+
+        for k, v in attachment_action.attachments.items():
+            #grab xform_attachments
+            #copy over attachments from form onto case
+            update_attachments[k] = v
+            if v.is_present:
+                #fetch attachment from xform
+                attachment_key = v.attachment_key
+                attach = stream_dict[attachment_key]
+                self.put_attachment(attach, name=attachment_key, content_type=v.server_mime)
+            else:
+                self.delete_attachment(k)
+                del(update_attachments[k])
+
+        self.case_attachments = update_attachments
+
+
     def apply_close(self, close_action):
         self.closed = True
         self.closed_on = close_action.date
@@ -589,11 +888,16 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
             conflict = CommCareCase.get(self._id)
             # if there's a conflict, make sure we know about every
             # form in the conflicting doc
-            if set(conflict.xform_ids) - set(self.xform_ids):
+            missing_forms = set(conflict.xform_ids) - set(self.xform_ids)
+            if missing_forms:
+                logging.exception('doc update conflict saving case {id}. missing forms: {forms}'.format(
+                    id=self._id,
+                    forms=",".join(missing_forms)
+                ))
                 raise
             # couchdbkit doesn't like to let you set _rev very easily
             self._doc["_rev"] = conflict._rev
-            self.save()
+            self.force_save()
 
     def to_xml(self, version):
         from xml.etree import ElementTree
@@ -603,11 +907,6 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
             elem = get_case_element(self, ('create', 'update'), version)
         return ElementTree.tostring(elem)
     
-    @classmethod
-    def get_by_xform_id(cls, xform_id):
-        return cls.view("case/by_xform_id", reduce=False, include_docs=True, 
-                        key=xform_id)
-
     def get_xform_ids_from_couch(self):
         """
         Like xform_ids, but will grab the raw output from couch (including
@@ -616,4 +915,148 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin):
         """
         return get_case_xform_ids(self._id)
 
+    # The following methods involving display configuration should probably go
+    # in their own layer, but for now it seems fine.
+    @classmethod
+    def get_display_config(cls):
+        return [
+            {
+                "layout": [
+                    [
+                        {
+                            "expr": "name",
+                            "name": _("Name"),
+                        },
+                        {
+                            "expr": "opened_on",
+                            "name": _("Opened On"),
+                            "parse_date": True,
+                        },
+                        {
+                            "expr": "modified_on",
+                            "name": _("Modified On"),
+                            "parse_date": True,
+                        },
+                        {
+                            "expr": "closed_on",
+                            "name": _("Closed On"),
+                            "parse_date": True,
+                        },
+                    ],
+                    [
+                        {
+                            "expr": "type",
+                            "name": _("Case Type"),
+                            "format": '<code>{0}</code>',
+                        },
+                        {
+                            "expr": "user_id",
+                            "name": _("User ID"),
+                            "format": '<span data-field="user_id">{0}</span>',
+                        },
+                        {
+                            "expr": "owner_id",
+                            "name": _("Owner ID"),
+                            "format": '<span data-field="owner_id">{0}</span>',
+                        },
+                        {
+                            "expr": "_id",
+                            "name": _("Case ID"),
+                        },
+                    ],
+                ],
+            }
+        ]
+
+    @property
+    def related_cases_columns(self):
+        return [
+            {
+                'name': _('Status'),
+                'expr': "status"
+            },
+            {
+                'name': _('Date Opened'),
+                'expr': "opened_on",
+                'parse_date': True,
+            },
+            {
+                'name': _('Date Modified'),
+                'expr': "modified_on",
+                'parse_date': True
+            }
+        ]
+
+    @property
+    def related_type_info(self):
+        return None
+
+
 import casexml.apps.case.signals
+
+
+class CommCareCaseGroup(Document):
+    """
+        This is a group of CommCareCases. Useful for managing cases in larger projects.
+    """
+    name = StringProperty()
+    domain = StringProperty()
+    cases = ListProperty()
+    timezone = StringProperty()
+
+    def get_time_zone(self):
+        # Necessary for the CommCareCaseGroup to interact with CommConnect, as if using the CommCareMobileContactMixin
+        # However, the entire mixin is not necessary.
+        return self.timezone
+
+    def get_cases(self, limit=None, skip=None):
+        case_ids = self.cases
+        if skip is not None:
+            case_ids = case_ids[skip:]
+        if limit is not None:
+            case_ids = case_ids[:limit]
+        for case_doc in iter_docs(CommCareCase.get_db(), case_ids):
+            # don't let CommCareCase-Deleted get through
+            if case_doc['doc_type'] == 'CommCareCase':
+                yield CommCareCase.wrap(case_doc)
+
+    def get_total_cases(self, clean_list=False):
+        if clean_list:
+            self.clean_cases()
+        return len(self.cases)
+
+    def clean_cases(self):
+        cleaned_list = []
+        for case_doc in iter_docs(CommCareCase.get_db(), self.cases):
+            # don't let CommCareCase-Deleted get through
+            if case_doc['doc_type'] == 'CommCareCase':
+                cleaned_list.append(case_doc['_id'])
+        if len(self.cases) != len(cleaned_list):
+            self.cases = cleaned_list
+            self.save()
+
+    @classmethod
+    def get_all(cls, domain, limit=None, skip=None):
+        extra_kwargs = {}
+        if limit is not None:
+            extra_kwargs['limit'] = limit
+        if skip is not None:
+            extra_kwargs['skip'] = skip
+        return cls.view(
+            'case/groups_by_domain',
+            startkey=[domain],
+            endkey=[domain, {}],
+            include_docs=True,
+            reduce=False,
+            **extra_kwargs
+        ).all()
+
+    @classmethod
+    def get_total(cls, domain):
+        data = cls.get_db().view(
+            'case/groups_by_domain',
+            startkey=[domain],
+            endkey=[domain, {}],
+            reduce=True
+        ).first()
+        return data['value'] if data else 0

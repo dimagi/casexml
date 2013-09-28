@@ -1,3 +1,5 @@
+from copy import copy
+from couchdbkit.exceptions import ResourceConflict, ResourceNotFound
 from couchdbkit.ext.django.schema import *
 from dimagi.utils.couch.database import SafeSaveDocument
 from dimagi.utils.mixins import UnicodeMixIn
@@ -15,14 +17,14 @@ class User(object):
     """
     
     def __init__(self, user_id, username, password, date_joined, 
-                 user_data=None, additional_owner_ids=[]):
+                 user_data=None, additional_owner_ids=None):
         self.user_id = user_id
         self.username = username
         self.password = password
         self.date_joined = date_joined
         self.user_data = user_data or {}
-        self.additional_owner_ids = additional_owner_ids
-    
+        self.additional_owner_ids = additional_owner_ids or []
+
     def get_owner_ids(self):
         ret = [self.user_id]
         ret.extend(self.additional_owner_ids)
@@ -72,7 +74,6 @@ class SyncLog(SafeSaveDocument, UnicodeMixIn):
     """
     A log of a single sync operation.
     """
-
     date = DateTimeProperty()
     user_id = StringProperty()
     previous_log_id = StringProperty()  # previous sync log, forming a chain
@@ -97,6 +98,26 @@ class SyncLog(SafeSaveDocument, UnicodeMixIn):
     owner_ids_on_phone = StringListProperty()
 
     strict = True # for asserts
+
+    def get_payload_attachment_name(self, version):
+        return 'restore_payload_{version}.xml'.format(version=version)
+
+    def has_cached_payload(self, version):
+        return self.get_payload_attachment_name(version) in self._doc.get('_attachments', {})
+
+    def get_cached_payload(self, version):
+        try:
+            return self.fetch_attachment(self.get_payload_attachment_name(version))
+        except ResourceNotFound:
+            return None
+
+    def set_cached_payload(self, payload, version):
+        self.put_attachment(payload, name=self.get_payload_attachment_name(version),
+                            content_type='text/xml')
+
+    def invalidate_cached_payloads(self):
+        for name in copy(self._doc.get('_attachments', {})):
+            self.delete_attachment(name)
 
     def _assert(self, conditional, msg="", case_id=None):
         if not conditional:
@@ -142,12 +163,16 @@ class SyncLog(SafeSaveDocument, UnicodeMixIn):
         Get the case state object associated with an id, or None if no such
         object is found
         """
-        filtered_list = [case for case in self.cases_on_phone if case.case_id == case_id]
+        # this is because we don't want to needlessly call wrap
+        # (which couchdbkit does not make any effort to cache on repeated calls)
+        # deterministically this change shaved off 10 seconds from an ota restore
+        # of about 300 cases.
+        filtered_list = [case for case in self._doc['cases_on_phone'] if case['case_id'] == case_id]
         if filtered_list:
             self._assert(len(filtered_list) == 1, \
                          "Should be exactly 0 or 1 cases on phone but were %s for %s" % \
                          (len(filtered_list), case_id))
-            return filtered_list[0]
+            return CaseState.wrap(filtered_list[0])
         return None
 
     def phone_has_dependent_case(self, case_id):
@@ -161,12 +186,13 @@ class SyncLog(SafeSaveDocument, UnicodeMixIn):
         Get the dependent case state object associated with an id, or None if no such
         object is found
         """
-        filtered_list = [case for case in self.dependent_cases_on_phone if case.case_id == case_id]
+        # see comment in get_case_state for reasoning
+        filtered_list = [case for case in self._doc['dependent_cases_on_phone'] if case['case_id'] == case_id]
         if filtered_list:
             self._assert(len(filtered_list) == 1, \
                          "Should be exactly 0 or 1 dependent cases on phone but were %s for %s" % \
                          (len(filtered_list), case_id))
-            return filtered_list[0]
+            return CaseState.wrap(filtered_list[0])
         return None
 
     def _get_case_state_from_anywhere(self, case_id):
@@ -195,44 +221,48 @@ class SyncLog(SafeSaveDocument, UnicodeMixIn):
         for case in case_list:
             actions = case.get_actions_for_form(xform.get_id)
             for action in actions:
-                try:
-                    if action.action_type == const.CASE_ACTION_CREATE:
-                        self._assert(not self.phone_has_case(case._id),
-                                     'phone has case being created: %s' % case._id)
-                        if self._phone_owns(action):
-                            self.cases_on_phone.append(CaseState(case_id=case.get_id,
-                                                                 indices=[]))
-                    elif action.action_type == const.CASE_ACTION_UPDATE:
-                        self._assert(
-                            self.phone_has_case(case._id),
-                            "phone doesn't have case being updated: %s" % case._id,
-                            case._id,
-                        )
 
-                        if not self._phone_owns(action):
-                            # only action necessary here is in the case of
-                            # reassignment to an owner the phone doesn't own
-                            self.archive_case(case.get_id)
-                    elif action.action_type == const.CASE_ACTION_INDEX:
-                        # in the case of parallel reassignment and index update
-                        # the phone might not have the case
-                        if self.phone_has_case(case.get_id):
-                            case_state = self.get_case_state(case.get_id)
-                        else:
-                            self._assert(self.phone_has_dependent_case(case._id),
-                                         "phone doesn't have referenced case: %s" % case._id)
-                            case_state = self.get_dependent_case_state(case.get_id)
-                        # reconcile indices
+                if action.action_type == const.CASE_ACTION_CREATE:
+                    self._assert(not self.phone_has_case(case._id),
+                                 'phone has case being created: %s' % case._id)
+                    if self._phone_owns(action):
+                        self.cases_on_phone.append(CaseState(case_id=case.get_id,
+                                                             indices=[]))
+                elif action.action_type == const.CASE_ACTION_UPDATE:
+                    self._assert(
+                        self.phone_has_case(case._id),
+                        "phone doesn't have case being updated: %s" % case._id,
+                        case._id,
+                    )
+
+                    if not self._phone_owns(action):
+                        # only action necessary here is in the case of
+                        # reassignment to an owner the phone doesn't own
+                        self.archive_case(case.get_id)
+                elif action.action_type == const.CASE_ACTION_INDEX:
+                    # in the case of parallel reassignment and index update
+                    # the phone might not have the case
+                    if self.phone_has_case(case.get_id):
+                        case_state = self.get_case_state(case.get_id)
+                    else:
+                        self._assert(self.phone_has_dependent_case(case._id),
+                                     "phone doesn't have referenced case: %s" % case._id)
+                        case_state = self.get_dependent_case_state(case.get_id)
+                    # reconcile indices
+                    if case_state:
                         case_state.update_indices(action.indices)
-                    elif action.action_type == const.CASE_ACTION_CLOSE:
-                        if self.phone_has_case(case.get_id):
-                            self.archive_case(case.get_id)
-                except Exception, e:
-                    # debug
-                    # import pdb
-                    # pdb.set_trace()
-                    raise
-        self.save()
+                elif action.action_type == const.CASE_ACTION_CLOSE:
+                    if self.phone_has_case(case.get_id):
+                        self.archive_case(case.get_id)
+        if case_list:
+            self.invalidate_cached_payloads()
+            try:
+                self.save()
+            except ResourceConflict:
+                logging.exception('doc update conflict saving sync log {id}'.format(
+                    id=self._id,
+                ))
+                raise
 
     def get_footprint_of_cases_on_phone(self):
         """
