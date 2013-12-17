@@ -44,19 +44,14 @@ class RestoreConfig(object):
                                         case_ids=self.sync_log.get_footprint_of_cases_on_phone())
 
     def get_commtrack_payload(self, syncop):
-        # uh-oh, cross-submodule circular reference
-        from corehq.apps.reports.commtrack.data_sources import StockStatusDataSource
+        # todo: fix this to not be badly dependent
+        from corehq.apps.commtrack.processing import product_subcases
 
         cases = [e.case for e in syncop.actual_cases_to_sync]
         supply_points = [c for c in cases if c.type == 'supply-point']
         def product_entries():
             for sp in supply_points:
-                location = sp.location_[-1]
-                # seems unavoidable to make a separate couch request per supply point
-                spps = StockStatusDataSource({
-                        'domain': sp.domain,
-                        'location_id': location,
-                    }).get_data()
+                spps = [spp.to_json() for spp in product_subcases(sp, create_new=False).values()]
                 for spp in spps:
                     spp['supply_point'] = sp._id
                     yield spp
@@ -79,8 +74,13 @@ class RestoreConfig(object):
                 stockout_since=_('stockout_since'),
             )
         for supply_point, products in product_by_supply_point.iteritems():
-            as_of = max(p['last_reported'] for p in products)
-            as_of = 'T'.join(as_of.split()) + 'Z' # FIXME convert to iso properly
+            product_last_reported_dates = filter(None, [p.get('last_reported', None) for p in products])
+            if product_last_reported_dates:
+                as_of = max(product_last_reported_dates)
+                as_of = 'T'.join(as_of.split()) + 'Z' # FIXME convert to iso properly
+            else:
+                # todo: fix when there are no dates available
+                as_of = ''
             yield E.balance(*(mk_product(e) for e in products), **{'entity-id': supply_point, 'date': as_of})
 
     def get_payload(self):
