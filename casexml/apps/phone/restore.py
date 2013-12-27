@@ -35,7 +35,6 @@ class RestoreConfig(object):
     def sync_log(self):
         return SyncLog.get(self.restore_id) if self.restore_id else None
 
-
     def validate(self):
         # runs validation checks, raises exceptions if anything is amiss
         check_version(self.version)
@@ -172,6 +171,7 @@ def generate_restore_payload(user, restore_id="", version=V1, state_hash=""):
     """
     config = RestoreConfig(user, restore_id, version, state_hash)
     return config.get_payload()
+
 
 def generate_restore_response(user, restore_id="", version="1.0", state_hash=""):
     return RestoreConfig(user, restore_id, version, state_hash).get_response()
