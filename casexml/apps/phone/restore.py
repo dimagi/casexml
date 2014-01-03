@@ -110,6 +110,8 @@ class RestoreConfig(object):
         for ct_elem in commtrack_elements:
             response.append(ct_elem)
 
+        response.attrib['items'] = '%d' % len(response.getchildren())
+
         resp = xml.tostring(response)
         self.set_cached_payload_if_enabled(resp)
         return resp
