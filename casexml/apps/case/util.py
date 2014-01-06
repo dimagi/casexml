@@ -100,3 +100,11 @@ def update_sync_log_with_checks(sync_log, xform, cases, case_id_blacklist=None):
             updated_log = SyncLog.get(sync_log._id)
 
             update_sync_log_with_checks(updated_log, xform, cases, case_id_blacklist=case_id_blacklist)
+
+
+def doc_from_doc_or_id(doc_or_doc_id, doc_type):
+    if isinstance(doc_or_doc_id, basestring):
+        doc = doc_type.get(doc_or_doc_id)
+    else:
+        doc = doc_or_doc_id
+    return doc

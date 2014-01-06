@@ -1,15 +1,15 @@
 from casexml.apps.case.models import CommCareCase
-from casexml.apps.case.util import get_case_xform_ids
+from casexml.apps.case.util import get_case_xform_ids, doc_from_doc_or_id
 from casexml.apps.case.xform import get_case_updates
 from couchforms.models import get as get_form
 
-def rebuild_case(case_id):
+def rebuild_case(case_or_case_id):
     """
     Given a case ID, rebuild the entire case state based on all existing forms
     referencing it. Useful when things go wrong or when you need to manually
     rebuild a case afer archiving / deliting it
     """
-    case = CommCareCase.get(case_id)
+    case = doc_from_doc_or_id(case_or_case_id, CommCareCase)
 
     # clear actions, xform_ids, and close state
     # todo: properties too?
@@ -20,14 +20,14 @@ def rebuild_case(case_id):
     case.closed_on = None
     case.closed_by = ''
 
-    form_ids = get_case_xform_ids(case_id)
+    form_ids = get_case_xform_ids(case._id)
     forms = [get_form(id) for id in form_ids]
     filtered_forms = [f for f in forms if f.doc_type == "XFormInstance"]
     sorted_forms = sorted(filtered_forms, key=lambda f: f.received_on)
     for form in sorted_forms:
         assert form.domain == case.domain
         case_updates = get_case_updates(form)
-        filtered_updates = [u for u in case_updates if u.id == case_id]
+        filtered_updates = [u for u in case_updates if u.id == case._id]
         for u in filtered_updates:
             case.update_from_case_update(u, form)
 
