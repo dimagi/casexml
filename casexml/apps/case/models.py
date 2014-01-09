@@ -1049,6 +1049,10 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin, CaseQuery
     def related_type_info(self):
         return None
 
+    def form_in_actions(self, form_id):
+        form_ids = [action.xform_id for action in self.actions]
+        return form_id in form_ids
+
 
 import casexml.apps.case.signals
 
