@@ -18,6 +18,9 @@ class StockReport(models.Model):
 
 class StockTransaction(models.Model):
     report = models.ForeignKey(StockReport)
+
+    stock_id = models.CharField(max_length=100, db_index=True)
+
     # for now, a supply point or requisition case
     case_id = models.CharField(max_length=100, db_index=True)
     product_id = models.CharField(max_length=100, db_index=True)
@@ -29,23 +32,24 @@ class StockTransaction(models.Model):
     stock_on_hand = models.DecimalField(max_digits=20, decimal_places=5)
 
     def __unicode__(self):
-        return '{type} of {quantity} to {soh} (case: {case}, product: {product})'.format(
+        return '{type} of {quantity} to {soh} (case: {case}, product: {product}, stock id: {stock_id})'.format(
             type=self.type, quantity=self.quantity, soh=self.stock_on_hand,
-            case=self.case_id, product=self.product_id,
+            case=self.case_id, product=self.product_id, stock_id=self.stock_id,
         )
 
     def get_previous_transaction(self):
-        siblings = StockTransaction._peer_qs(self.case_id, self.product_id).exclude(pk=self.pk)
+        siblings = StockTransaction._peer_qs(self.case_id, self.stock_id, self.product_id).exclude(pk=self.pk)
         if siblings.count():
             return siblings[0]
 
     @classmethod
-    def latest(cls, case_id, product_id):
-        relevant = cls._peer_qs(case_id, product_id)
+    def latest(cls, case_id, stock_id, product_id):
+        relevant = cls._peer_qs(case_id, stock_id, product_id)
         if relevant.count():
             return relevant[0]
         return None
 
     @classmethod
-    def _peer_qs(self, case_id, product_id):
-        return StockTransaction.objects.filter(case_id=case_id, product_id=product_id).order_by('-report__date')
+    def _peer_qs(self, case_id, stock_id, product_id):
+        return StockTransaction.objects.filter(
+            case_id=case_id, product_id=product_id, stock_id=stock_id).order_by('-report__date')
