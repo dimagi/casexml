@@ -417,11 +417,14 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin, CaseQuery
         return cls
 
     @classmethod
-    def bulk_get_lite(cls, ids):
+    def bulk_get_lite(cls, ids, wrap=True):
         for res in cls.get_db().view("case/get_lite", keys=ids,
                                  include_docs=False):
             # cls.wrap is called in a lot of places; do they all need to be updated?
-            yield cls.get_wrap_class(res['value']).wrap(res['value'])
+            if wrap:
+                yield cls.get_wrap_class(res['value']).wrap(res['value'])
+            else:
+                yield res['value']
 
     def get_preloader_dict(self):
         """
