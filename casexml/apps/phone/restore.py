@@ -1,12 +1,15 @@
 import hashlib
 from couchdbkit import ResourceConflict
 from dimagi.utils.decorators.memoized import memoized
+from dimagi.utils.parsing import json_format_datetime
 from casexml.apps.case.exceptions import BadStateException, RestoreException
 from casexml.apps.phone.models import SyncLog, CaseState
 import logging
 from dimagi.utils.couch.database import get_db, get_safe_write_kwargs
 from casexml.apps.phone import xml
 from datetime import datetime
+from casexml.apps.stock.const import COMMTRACK_REPORT_XMLNS
+from casexml.apps.stock.models import StockTransaction
 from dimagi.utils.couch.cache.cache_core import get_redis_default_cache
 from receiver.xml import get_response_element, get_simple_response_xml,\
     ResponseNature
@@ -14,7 +17,6 @@ from casexml.apps.case.xml import check_version, V1
 from casexml.apps.phone.fixtures import generator
 from django.http import HttpResponse, Http404
 from casexml.apps.phone.checksum import CaseStateHash
-
 
 class RestoreConfig(object):
     """
@@ -51,6 +53,26 @@ class RestoreConfig(object):
                                         actual=parsed_hash,
                                         case_ids=self.sync_log.get_footprint_of_cases_on_phone())
 
+    def get_stock_payload(self, syncop):
+        cases = [e.case for e in syncop.actual_cases_to_sync]
+        from lxml.builder import ElementMaker
+        E = ElementMaker(namespace=COMMTRACK_REPORT_XMLNS)
+
+        def transaction_to_xml(trans):
+            return E.entry(
+                id=trans.product_id,
+                quantity=str(int(trans.stock_on_hand)),
+            )
+        for commtrack_case in cases:
+            relevant_sections = sorted(StockTransaction.objects.filter(case_id=commtrack_case._id).values_list('section_id', flat=True).distinct())
+            for section_id in relevant_sections:
+                relevant_reports = StockTransaction.objects.filter(case_id=commtrack_case._id, section_id=section_id)
+                product_ids = sorted(relevant_reports.values_list('product_id', flat=True).distinct())
+                products = [relevant_reports.filter(product_id=p).order_by('-report__date').select_related()[0] for p in product_ids]
+                as_of = json_format_datetime(max(p.report.date for p in products))
+                yield E.balance(*(transaction_to_xml(e) for e in products),
+                                **{'entity-id': commtrack_case._id, 'date': as_of, 'section-id': section_id})
+
     def get_payload(self):
         user = self.user
         last_sync = self.sync_log
@@ -64,7 +86,7 @@ class RestoreConfig(object):
         sync_operation = user.get_case_updates(last_sync)
         case_xml_elements = [xml.get_case_element(op.case, op.required_updates, self.version)
                              for op in sync_operation.actual_cases_to_sync]
-
+        commtrack_elements = self.get_stock_payload(sync_operation)
 
         last_seq = str(get_db().info()["update_seq"])
 
@@ -95,6 +117,8 @@ class RestoreConfig(object):
         # case blocks
         for case_elem in case_xml_elements:
             response.append(case_elem)
+        for ct_elem in commtrack_elements:
+            response.append(ct_elem)
 
         resp = xml.tostring(response)
         self.set_cached_payload_if_enabled(resp)
