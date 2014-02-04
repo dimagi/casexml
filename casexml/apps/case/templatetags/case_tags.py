@@ -167,6 +167,8 @@ def process_case_hierarchy(case_output, get_case_url, type_info):
         if 'description_property' in data:
             data['description'] = getattr(
                     case, data['description_property'], None)
+        if 'edit_session_data' in data:
+            data['session_data'].update(data['edit_session_data'])
         data.update(common_data)
 
         case.edit_data = data
@@ -181,34 +183,23 @@ def process_case_hierarchy(case_output, get_case_url, type_info):
                 },
                 "parent_node_id": case.case_id,
             })
+
+            if 'create_session_data' in child_data:
+                child_data['session_data'].update(child_data['create_session_data'])
             case.add_child_data = child_data
 
     process_output(case_output)
 
 def get_case_hierarchy(case, type_info):
-    # PACT has a Patient -> Goal -> Task case hierarchy, but subcase
-    # relationships are duplicated/"bubbled up" up the ancestor chain.  To
-    # remove this duplication, we just look at the case types, assuming that a
-    # given level can't have any children whose case types appear at lower
-    # levels. A more general solution would require slightly more work.
-    # 
-    # - Pact Patient
-    #   - Care Plan Goal 1
-    #     - Care Plan Task 1
-    #   - Care Plan Task 1
-
     def get_children(case):
         children = [get_children(i.referenced_case) for i in case.reverse_indices]
-
         # non-first-level descendants
         descendant_types = []
         for c in children:
             descendant_types.extend(c['descendant_types'])
         descendant_types = list(set(descendant_types))
 
-        children = sorted(
-            [c for c in children if c['case'].type not in descendant_types],
-            key=partial(sortkey, type_info=type_info))
+        children = sorted(children, key=partial(sortkey, type_info=type_info))
        
         # set parent_case_id used by flat display
         for c in children:
@@ -233,7 +224,6 @@ def get_flat_descendant_case_list(case, get_case_url, type_info=None):
     type_info = type_info or {}
     hierarchy = get_case_hierarchy(case, type_info)
     process_case_hierarchy(hierarchy, get_case_url, type_info)
-
     return hierarchy['case_list']
 
 

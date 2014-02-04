@@ -90,7 +90,7 @@ class CommCareCaseAction(LooselyEqualDocumentSchema):
     @classmethod
     def from_parsed_action(cls, date, user_id, xformdoc, action):
         if not action.action_type_slug in const.CASE_ACTIONS:
-            raise ValueError("%s not a valid case action!" % action.action_type)
+            raise ValueError("%s not a valid case action!" % action.action_type_slug)
         
         ret = CommCareCaseAction(action_type=action.action_type_slug, date=date, user_id=user_id)
         
@@ -771,6 +771,8 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin, CaseQuery
             self.apply_close(action)
         elif action.action_type == const.CASE_ACTION_ATTACHMENT:
             self.apply_attachments(action)
+        elif action.action_type == const.CASE_ACTION_COMMTRACK:
+            pass  # no action needed here, it's just a placeholder stub
         else:
             raise ValueError("Can't apply action of type %s" % action.action_type)
 
@@ -833,11 +835,6 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin, CaseQuery
     def apply_close(self, close_action):
         self.closed = True
         self.closed_on = close_action.date
-
-    def force_close(self, submit_url):
-        if not self.closed:
-            submission = get_close_case_xml(time=datetime.utcnow(), case_id=self._id)
-            spoof_submission(submit_url, submission, name="close.xml")
 
     def reconcile_actions(self, rebuild=False):
         """
@@ -924,11 +921,6 @@ class CommCareCase(CaseBase, IndexHoldingMixIn, ComputedDocumentMixin, CaseQuery
         for a in self.actions:
             if a.xform_id not in self.xform_ids:
                 self.xform_ids.append(a.xform_id)
-
-    def force_close_referral(self, submit_url, referral):
-        if not referral.closed:
-            submission = get_close_referral_xml(time=datetime.utcnow(), case_id=self._id, referral_id=referral.referral_id, referral_type=referral.type)
-            spoof_submission(submit_url, submission, name="close_referral.xml")
 
     def dynamic_case_properties(self):
         """(key, value) tuples sorted by key"""

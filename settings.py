@@ -12,6 +12,7 @@ INSTALLED_APPS = (
     'django.contrib.sites',
     'casexml.apps.case',
     'casexml.apps.phone',
+    'casexml.apps.stock',
     'couchdbkit.ext.django',
     'couchforms',
     'django.contrib.contenttypes',
@@ -38,9 +39,6 @@ COUCH_DATABASE = 'http://127.0.0.1:5984/casexml_test'
 
 COUCHDB_DATABASES = [ (app, 'http://127.0.0.1:5984/casexml') for app in ['case', 'couch', 'couchforms', 'phone'] ]
 
-
-# Hardcode the test database?
-XFORMS_POST_URL = "http://127.0.0.1:5984/casexml_test/_design/couchforms/_update/xform/" 
 
 TEST_RUNNER = 'couchdbkit.ext.django.testrunner.CouchDbKitTestSuiteRunner'
 
