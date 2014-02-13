@@ -18,8 +18,8 @@ def process_cases(sender, xform, config=None, **kwargs):
 
 @log_exception()
 def _process_cases(sender, xform, config=None, **kwargs):
-    from casexml.apps.case import process_cases
-    process_cases(xform, config)
+    from casexml.apps.case.tasks import process_cases
+    process_cases.delay(xform, config)
 
 
 successful_form_received.connect(_process_cases)
