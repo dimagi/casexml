@@ -93,7 +93,7 @@ def _process_cases(xform, config, case_db):
     # if there are pillows or other _changes listeners competing to update
     # this form, override them. this will create a new entry in the feed
     # that they can re-pick up on
-    xform.save(force_update=True)
+    xform.save()
 
     return cases
 

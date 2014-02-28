@@ -25,14 +25,14 @@ from dimagi.utils.modules import to_function
 from dimagi.utils import parsing, web
 from dimagi.utils.decorators.memoized import memoized
 from dimagi.utils.indicators import ComputedDocumentMixin
-from receiver.util import spoof_submission
 from couchforms.models import XFormInstance
 from casexml.apps.case.sharedmodels import IndexHoldingMixIn, CommCareCaseIndex, CommCareCaseAttachment
-from dimagi.utils.couch.database import get_db, SafeSaveDocument, iter_docs
+from dimagi.utils.couch.database import iter_docs
 from dimagi.utils.couch import (
     CouchDocLockableMixIn,
     LooselyEqualDocumentSchema,
 )
+from sqlcouch.models import SQLDoc
 
 
 """
@@ -49,7 +49,7 @@ CASE_STATUS_ALL = 'all'
 INDEX_ID_PARENT = 'parent'
 
 
-class CaseBase(SafeSaveDocument):
+class CaseBase(SQLDoc):
     """
     Base class for cases and referrals.
     """
