@@ -35,10 +35,10 @@ class CaseDbCacheTest(TestCase):
 
     def testDocTypeCheck(self):
         id = uuid.uuid4().hex
-        CommCareCase.get_db().save_doc({
+        CommCareCase.wrap({
             "_id": id,
             "doc_type": "AintNoCasesHere"
-        })
+        }).save()
         cache = CaseDbCache()
         try:
             cache.get(id)
