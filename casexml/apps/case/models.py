@@ -52,7 +52,7 @@ CASE_STATUS_ALL = 'all'
 INDEX_ID_PARENT = 'parent'
 
 
-class CaseBase(SafeSaveDocument):
+class CaseBase(Document):
     """
     Base class for cases and referrals.
     """
